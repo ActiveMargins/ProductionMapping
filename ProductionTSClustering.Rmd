@@ -1,0 +1,208 @@
+---
+title: "Production mapping using unsupervised classification"
+output: html_notebook
+---
+
+Time series production is a staple data type in the oil and gas industry. Geologist and engineers use these time series data that relate the volumes of fluids produced over time to reservoir performance or reservoir characteristics (e.g., primary or secondary porostiy). However, time series data is difficult to display in a 2D map. This project was an attempt to use unsupervised classification of the production curves through dynamic time warping to cluster/classify them and more easily map production.
+
+This notebook contains a series of scripts used to tidy/clean production data for Alberta, filter data for specific formations/fields, visualize production curves, and then cluster/classify production curves. In the future this could be turned into a single script of functions or a ShinyApp. For now it will live here, like this. 
+
+
+Libraries used for this script are
+```{r}
+#Data handling
+library(dplyr)
+library(readr)
+library(tidyr)
+library(RANN)
+
+#Time series stuff
+library(dtwclust)
+
+#Plotting and geospatial stuff
+library(ggplot2)
+library(sf)
+library(leaflet)
+```
+
+
+The first chunk below takes many related files and processes them a single tidied file for analysis. This takes input .csv in their raw form and manipulate them in one script to create the final data that will be used in the data analysis.
+
+Inputs:
+  CONTROL.TXT will be filtered to the key columns 
+  PRDHIST.TXT will be reformatted into a reasonable format that can be handled. Accessed at: http://www1.aer.ca/ProductCatalogue/271.html
+  List_of_Horizontal_Wells_data.csv - information regarding horizontally drilled wells. Accessed at: https://www.aer.ca/providing-information/data-and-reports/activity-and-data/horizontal-well-list
+  Well bottom hole location. Accessed at: https://www.aer.ca/providing-information/data-and-reports/statistical-reports/st37 . The text verion of the file is most useful but could be converted from shapefile to .csv
+
+Outputs:
+  prod_total - a tidied dataframe (quite large...watch out) that contains the volume of produced fluids. It is a long-format dataframe that contains individual rows for each year for each well.  
+
+Notes:
+Information regarding the structure of the CONTROL.TXT and PRDHIST.TXT files can be found in the following word document. https://static.aer.ca/prd/2020-09/well-production-data-all-alberta-layout-file.docx It is a wild format...
+```{r}
+#1.1 Import the production well control document from the CONTROL.TXT
+prodcontrol <- read.delim("~/R_data/ProductionMapping/Data/RawData/Production/CONTROL.TXT", header=FALSE, stringsAsFactors = FALSE)
+
+#1.2 Select and rename desired columns, use regex gsub to remove special characters and spaces 
+prodcontrol <- prodcontrol %>% 
+  select(WellIdentifier=V2, WellName=V3, PoolCode=V12, PoolName=V13)
+prodcontrol$PoolName <- gsub("[^A-Za-z0-9,;._-]","",prodcontrol$PoolName)
+
+#2.0 Dealing with the production history
+#2.1 Import the raw production history of Alberta from the big .txt and set up data types of the columns we want. 
+proddata <- read_tsv("~/R_data/ProductionMapping/Data/RawData/Production/PRDHIST.TXT",
+	col_names=FALSE,
+	progress=TRUE,
+	col_types = cols(
+		X2 = "c", #X2 = WellIdentifier (rename to WellIdentifier)
+		X3 = "i", #X3 = Fluid Year (rename to FluidYear)
+		X54 = "i", #X54 = Fluid Code 1
+		X55 = "d", #X55 = Annual Fluid Volume 1
+		X70 = "i", #X70 = Fluid Code 2
+		X71 = "d", #X71 = Annual Fluid Volume 2
+		X86 = "i", #X86 = Fluid Code 3
+		X87 = "d", #X87 = Annual Fluid Volume 3
+		X102 = "i", #X102 = Fluid Code 4
+		X103 = "d", #X103 = Annual Fluid Volume 4
+		X118 = "i", #X118 = Fluid Code 5
+		X119 = "d", #X119 = Annual Fluid Volume 5
+		X134 = "i", #X134 = Fluid Code 6
+		X135 = "d", #X135 = Annual Fluid Volume 6
+		X150 = "i", #V150 = Fluid Code 7
+		X151 = "d", #V151 = Annual Fluid Volume 7
+		X166 = "i", #X166 = Fluid Code 8
+		X167 = "d" #X167 = Annual Fluid Volume 8
+		)
+	)
+
+#2.2 Drop the data we don't want, rename the first two columns, then add the new fluid columns. The order of these columns is specifically the same as the order of the fluid codes in the vector (FluidVector) below.
+proddata <- proddata %>%
+  select(X2,X3,X54,X55,X70,X71,X86,X87,X102,X103,X118,X119,X134,X135,X150,X151,X166,X167) %>% #These are the columns that we want
+  rename(WellIdentifier=X2, FluidYear=X3) %>%  #Rename the ones that we will ultimately keep
+  mutate(GasProd=-99.99, WaterProd=-99.99, LiquidGasProd=-99.99, OilProd=-99.99, PropaneProd=-99.99, ButaneProd=-99.99) #Make new numeric columns with distinct null values
+
+#2.3 Organize the fluid data which is currently scattered through 8 columns
+  #The fluids we are interested have the following Fluid Codes
+  	#2 = Gas
+  	#6 = Water
+  	#16 = Liquid Petroleum Gas
+  	#51 = Crude oil/bitumen
+  	#53 = Propane
+  	#54 = Butane
+
+#2.3.1 Set up the fluid vector for incrementing through the fluids
+FluidVector <- c(2,6,16,51,53,54)
+NumFluids <- length(FluidVector)
+PlaceVector <- c(1:NumFluids)
+
+#2.3.2 For loop for each pair of production columns (each Fluid Code/Annual Fluid Volume pair)
+for (ProdColumn in seq(3,17, by=2)){
+  
+  #2.3.3 For loop for each fluid type in the search vector (Fluid Vector), we will increment through the PlaceVector (1:NumFluids) but use that to go through each fluids
+	for (i in PlaceVector) {
+		
+		print(paste("Prod Column=",ProdColumn,". FluidNumber=",FluidVector[i],sep=""))
+		
+		#2.3.4 We are going to use which statements to grab just the fluids we want and put them in the correct recently added column (e.g., GasProd, WaterProd)
+		FluidObservations <- which(proddata[,ProdColumn]==FluidVector[i])
+		
+		#Use the vector to copy those values into the new fluid volumes
+		proddata[FluidObservations,18+i] <- proddata[FluidObservations,ProdColumn+1]
+		
+	} #increment to the next produced fluid
+} #increment to the next column
+
+print("Production data sorted")
+
+#2.4 Keep only the data that we really want (WellID, production year, production volumes for all fluids)
+proddata <- proddata %>%
+  select(WellIdentifier,FluidYear,GasProd,WaterProd,LiquidGasProd,OilProd,PropaneProd,ButaneProd)
+proddata[proddata==-99.99]<-NA #Remove pesky -99.99 null values.
+
+#2.5 Create prod_total by joining the control file (filtered up above - prodcontrol_filter) to the proddata_filtered
+prod_total <- left_join(proddata, prodcontrol, by="WellIdentifier")
+
+#2.6 Reformat the Well Identifier to a normal UWI
+prod_total <- prod_total %>%
+  mutate(WellIdentifier=paste(substr(WellIdentifier,11,12),"/",substr(WellIdentifier,9,10),"-",substr(WellIdentifier,7,8),"-",substr(WellIdentifier,1,3),"-",substr(WellIdentifier,5,6),"W",substr(WellIdentifier,4,4),"/",substr(WellIdentifier,13,13),sep="")) %>%
+  rename(UWI = WellIdentifier)
+
+#3.0 Format information regarding horizontal wells (List_of_Horizontal_Wells_data.csv)
+horizontal_well <- read.csv("~/R_data/ProductionMapping/Data/RawData/WellLicense/List_of_Horizontal_Wells_data.csv")
+horizontal_well <- horizontal_well %>%
+  select(UWI=Well.Uwi.Formatted) %>%
+  mutate(Horizontal=1)
+
+#3.1 Join horizontal well information to 
+prod_total <- left_join(x=prod_total, y=horizontal_well)
+
+#4.0 Borehole locations. This is the AER "WellLocations_Bottom.csv" but I have converted/added UTM locations to it through a spreadsheet https://giscrack.com/download-excel-template-convert-geographic-coordinates-utm/ - this might have to be changed...
+welllocations <- read.csv("~/R_data/ProductionMapping/Data/RawData/WellLocation/WellLocations_Bottom.csv",stringsAsFactors = FALSE)
+
+#4.1 Rename WellIdentifier to UWI, drop columns we don't need
+welllocations <- welllocations %>% 
+  select(UWI, BH_Long, BH_Lat, BH_Easting, BH_Northing)
+
+#4.2 Join location to total production 
+prod_total <- left_join(x=prod_total, y=welllocations)
+
+#5.0 drop all unnesssary data and values
+rm(horizontal_well, prodcontrol, proddata, welllocations, FluidObservations, FluidVector, i, NumFluids, PlaceVector,ProdColumn)
+
+```
+
+This chunk takes the "prod_total" dataframe and creates a dataset specific to a single interval (e.g., Viking) or pool (Viking A). This is done by using a PoolSearchTerm and grepl filter on the PoolName column. To select the PoolSearchTerm look at unique values within the prod_total$PoolName: unique(prod_total$PoolName).
+
+Inputs:
+  pool_prod - the total production for tall of Alberta (df)
+  PoolSearchTerm - the name of the interval or pool that we want to filter the data for (string)
+  
+Outputs:
+  pool_prod - a dataframe of the production data (by year)
+  pool_prod_vis - a dataframe that includes the 
+  
+```{r}
+#INPUTS
+#This is a string term that can be used below to subset the prod_total (e.g., "SAWTOOTH" or "SAWTOOTH WWW")
+PoolSearchTerm <- "VIKING"
+
+
+#--------------------------------------------------------------------------------
+#Filter prod_total by a partial name (e.g., "SAWTOOTH" or "SAWTOOTH WWW")
+pool_prod <- prod_total %>% 
+  filter(grepl(PoolSearchTerm,PoolName)) %>%
+  group_by(UWI) %>%
+  mutate(seqyear=1:length(FluidYear)) %>%
+  ungroup()
+
+#Create visualization dataframe for mapping
+pool_prod_vis <- pool_prod %>% 
+  group_by(UWI) %>% 
+  summarize(YearMin = min(FluidYear), 
+            YearMax=max(FluidYear), 
+            OilProd=sum(OilProd), 
+            GasProd=sum(GasProd), 
+            LiquidGasProd=sum(LiquidGasProd),
+            BH_Long=min(BH_Long), 
+            BH_Lat=min(BH_Lat)) %>% 
+  mutate(Rad_oil=((OilProd-min(OilProd, na.rm=TRUE)))/(max(OilProd, na.rm=TRUE)-min(OilProd, na.rm=TRUE))*1000,
+         Rad_oil = ifelse(is.na(Rad_oil), min(Rad_oil, na.rm=TRUE)/2+1,Rad_oil),
+         Rad_gas=((GasProd-min(GasProd, na.rm=TRUE)))/(max(GasProd, na.rm=TRUE)-min(GasProd, na.rm=TRUE))*1000,
+         Rad_gas = ifelse(is.na(Rad_gas), min(Rad_gas, na.rm=TRUE)/2,Rad_gas),
+         Rad_lgas=((LiquidGasProd-min(LiquidGasProd, na.rm=TRUE)))/(max(LiquidGasProd, na.rm=TRUE)-min(LiquidGasProd, na.rm=TRUE))*1000,
+         Rad_lgas = ifelse(is.na(Rad_lgas), min(Rad_lgas, na.rm=TRUE)/2,Rad_lgas)
+         )
+
+```
+
+This section creates a leaflet map out of "pool_prod_vis" dataframe. Note the "radius=" term is default pointing a radius value for oil production there is also "Rad_gas" or "Rad_lgas"
+```{r}
+leaflet() %>% 
+  addTiles() %>% 
+  addCircles(data=pool_prod_vis, 
+             lng=~BH_Long, 
+             lat=~BH_Lat, 
+             radius=~Rad_oil, 
+             opacity = 0.5, 
+             popup=paste("UWI:",pool_prod_vis$UWI,"<br/>","Produced from:", pool_prod_vis$YearMin, " to ", pool_prod_vis$YearMax, "<br/>", "Oil produced: ", pool_prod_vis$OilProd, "m^3", "<br/>", "Gas produced: ", pool_prod_vis$GasProd, "1000 m^3", "<br/>", "Liquid gas produced: ", pool_prod_vis$LiquidGasProd, "m^3"))
+
